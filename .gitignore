@@ -1,3 +1,17 @@
 __pycache__/
-.env
 *.pyc
+.env
+
+# Python virtual environments
+.venv/
+venv/
+
+# Runtime/generated databases
+*.db
+*.sqlite3
+
+# ChromaDB generated files
+data/chroma/
+
+# Uploaded/generated data
+data/uploaded_files_sqldb.db
