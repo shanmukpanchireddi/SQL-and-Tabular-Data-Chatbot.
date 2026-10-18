@@ -11,11 +11,10 @@ with gr.Blocks(title="Table Talk - AI-Powered SQL Chatbot") as demo:
         with gr.TabItem("Q&A-and-RAG-with-SQL-and-TabularData"):
             with gr.Row() as row_one:
                 chatbot = gr.Chatbot(
-                    [],
+                    value=[],
                     elem_id="chatbot",
-                    bubble_full_width=False,
-                    height=500
-                )
+                    height=500,
+                    )
                 chatbot.like(UISettings.feedback, None, None)
 
             with gr.Row():

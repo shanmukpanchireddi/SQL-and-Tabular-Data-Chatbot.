@@ -1,267 +1,439 @@
+
 import os
 import re
 import time
 import logging
-from typing import List, Tuple, Any
+from typing import Any, List, Tuple
+
 from sqlalchemy import create_engine, text
 from langchain_community.utilities import SQLDatabase
 from langchain.chains import create_sql_query_chain
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+
 from utils.load_config import LoadConfig
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 APPCFG = LoadConfig()
 
+
 SQL_PROMPT = PromptTemplate(
     input_variables=["input", "top_k", "dialect", "table_info"],
-    template="""You are a {dialect} expert. Given an input question, create a syntactically correct {dialect} query to run.
-Unless the user specifies a specific number of examples to obtain, limit your query to at most {top_k} results.
-Never query for all columns from a table. Only ask for the relevant columns given the question.
+    template="""You are a {dialect} expert. Given a question, create a
+syntactically correct, read-only SQL query.
 
-Table Schema:
+Unless the user specifies a number of examples, limit results to {top_k}.
+Never select all columns unless necessary. Use the exact table and column
+names provided in the schema.
+
+Schema:
 {table_info}
 
 Rules:
-1. Output ONLY the raw SQL query. Do not wrap in markdown code blocks or add preambles.
-2. For queries asking for distinct values of a column (e.g. "distinct genres values" or "distinct column values"), return standard SQL:
-   SELECT COUNT(DISTINCT column_name) FROM table_name;
-3. For queries asking for individual items stored as pipe-separated '|' values in a text column (e.g. "individual genres"), use a SQLite WITH RECURSIVE CTE:
-   WITH RECURSIVE split(col_item, rest) AS (
-     SELECT
-       CASE WHEN instr(col, '|') > 0 THEN substr(col, 1, instr(col, '|') - 1) ELSE col END,
-       CASE WHEN instr(col, '|') > 0 THEN substr(col, instr(col, '|') + 1) ELSE '' END
-     FROM table_name
-     UNION ALL
-     SELECT
-       CASE WHEN instr(rest, '|') > 0 THEN substr(rest, 1, instr(rest, '|') - 1) ELSE rest END,
-       CASE WHEN instr(rest, '|') > 0 THEN substr(rest, instr(rest, '|') + 1) ELSE '' END
-     FROM split
-     WHERE rest <> ''
-   )
-   SELECT COUNT(DISTINCT col_item) FROM split WHERE col_item <> '' AND col_item IS NOT NULL;
+1. Output only the SQL query.
+2. Use SELECT or WITH queries only.
+3. For questions asking how many distinct values exist in a column,
+   use COUNT(DISTINCT column_name).
+4. For pipe-separated values in SQLite text columns, use a recursive CTE
+   when individual values need to be counted.
 
 Question: {input}
-SQLQuery:"""
+SQLQuery:""",
 )
 
-ANSWER_PROMPT_TEMPLATE = """You are an AI data assistant. Provide a helpful, clear, and direct answer to the user's question based strictly on the provided SQL query and SQL execution result.
 
-User Question: {question}
-Executed SQL: {query}
-SQL Execution Result: {result}
+ANSWER_PROMPT_TEMPLATE = """You are an AI data assistant.
 
-Rules:
-- Answer the user's question directly and concisely based ONLY on the SQL result.
-- If the result contains tabular data, summarize key metrics or present the data clearly.
-- If the result is a single number or text, state it directly.
-- Do not mention SQL query details or internal syntax unless asked.
-- Never invent information not contained in the SQL result.
+Answer the user's question using only the supplied SQL result.
+
+Question: {question}
+SQL query: {query}
+SQL result: {result}
+
+Give a clear, concise answer. Do not invent information.
 Answer:"""
 
-def invoke_with_retry(runnable: Any, input_data: dict, max_retries: int = 3) -> Any:
-    """Invoke runnable chain with automatic backoff retry for rate limits and transient connection errors."""
+
+def invoke_with_retry(
+    runnable: Any,
+    input_data: dict,
+    max_retries: int = 3,
+) -> Any:
     for attempt in range(max_retries):
         try:
             return runnable.invoke(input_data)
-        except Exception as e:
-            err_str = str(e).lower()
-            is_transient = any(k in err_str for k in ["rate limit", "429", "rate_limit", "connection error", "getaddrinfo failed", "connecterror"])
-            if is_transient and attempt < max_retries - 1:
-                sleep_sec = 2 * (attempt + 1)
-                logger.warning(f"Transient error ({e}). Retrying in {sleep_sec}s (Attempt {attempt+1}/{max_retries})...")
-                time.sleep(sleep_sec)
-            else:
-                raise e
+        except Exception as exc:
+            error_text = str(exc).lower()
+            transient = any(
+                term in error_text
+                for term in (
+                    "rate limit",
+                    "429",
+                    "connection error",
+                    "connecterror",
+                    "getaddrinfo failed",
+                    "timeout",
+                )
+            )
+
+            if not transient or attempt == max_retries - 1:
+                raise
+
+            delay = 2 * (attempt + 1)
+            logger.warning(
+                "Temporary API/network error. Retrying in %s seconds.",
+                delay,
+            )
+            time.sleep(delay)
+
+    raise RuntimeError("The request failed after multiple attempts.")
+
 
 def clean_sql_query(query: str) -> str:
-    """Extract and clean raw SQL statement from LLM output."""
     if not query:
         return ""
-    
-    # 1. Extract content inside markdown code blocks
-    markdown_match = re.search(r"```(?:sql)?\s*(.*?)\s*```", query, flags=re.DOTALL | re.IGNORECASE)
-    if markdown_match:
-        query = markdown_match.group(1)
 
-    # 2. Extract content after SQLQuery / Query labels
-    sql_label_match = re.search(r"(?:SQLQuery|SQL Query|Query|SQL):\s*(.*)", query, flags=re.DOTALL | re.IGNORECASE)
-    if sql_label_match:
-        query = sql_label_match.group(1)
+    query = query.strip()
 
-    # 3. Match SQL starting keywords (WITH, SELECT, PRAGMA, EXPLAIN)
-    select_match = re.search(r"\b(WITH|SELECT|PRAGMA|EXPLAIN)\b.*", query, flags=re.DOTALL | re.IGNORECASE)
-    if select_match:
-        query = select_match.group(0)
+    match = re.search(
+        r"```(?:sql)?\s*(.*?)```",
+        query,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if match:
+        query = match.group(1).strip()
 
-    # 4. Remove trailing semicolons
-    if ";" in query:
-        query = query.split(";")[0]
+    query = re.sub(
+        r"^\s*(?:SQLQuery|SQL Query|Query|SQL)\s*:\s*",
+        "",
+        query,
+        flags=re.IGNORECASE,
+    ).strip()
 
-    return query.strip()
+    match = re.search(
+        r"\b(WITH|SELECT|PRAGMA|EXPLAIN)\b.*",
+        query,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if match:
+        query = match.group(0).strip()
+
+    # Remove a trailing semicolon without truncating SQL inside a statement.
+    query = query.rstrip().rstrip(";").strip()
+    return query
+
 
 def validate_sql_query(query: str) -> bool:
-    """Validate that the query is non-empty and read-only."""
     if not query:
-        raise ValueError("Generated SQL query is empty.")
-    
-    upper_query = query.strip().upper()
-    forbidden = ["DROP", "DELETE", "INSERT", "UPDATE", "ALTER", "TRUNCATE", "CREATE"]
-    for word in forbidden:
-        if re.search(r"\b" + word + r"\b", upper_query):
-            raise ValueError(f"DML operation '{word}' is not permitted.")
+        raise ValueError("The generated SQL query is empty.")
 
-    allowed_starts = ("SELECT", "WITH", "PRAGMA", "EXPLAIN")
-    if not any(upper_query.startswith(kw) for kw in allowed_starts):
-        raise ValueError(f"Invalid SQL: query must begin with SELECT or WITH. Got: '{query[:30]}...'")
-    
+    cleaned = query.strip()
+
+    # Only permit read-only query forms.
+    if not re.match(
+        r"^(SELECT|WITH|PRAGMA|EXPLAIN)\b",
+        cleaned,
+        flags=re.IGNORECASE,
+    ):
+        raise ValueError("Only read-only SQL queries are permitted.")
+
+    # Block multiple statements and write operations.
+    if ";" in cleaned:
+        raise ValueError("Multiple SQL statements are not permitted.")
+
+    if re.search(
+        r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|REPLACE|"
+        r"ATTACH|DETACH|VACUUM|REINDEX)\b",
+        cleaned,
+        flags=re.IGNORECASE,
+    ):
+        raise ValueError("A write or database-modification operation was blocked.")
+
     return True
 
-def execute_sql_with_sqlalchemy(db: SQLDatabase, query: str) -> List[Tuple]:
-    """Execute raw SQL query using SQLAlchemy connection."""
-    engine = db._engine
-    with engine.connect() as connection:
-        result_proxy = connection.execute(text(query))
-        if result_proxy.returns_rows:
-            rows = result_proxy.fetchall()
-            return [tuple(row) for row in rows]
-        return []
+
+def execute_sql_with_sqlalchemy(
+    db: SQLDatabase,
+    query: str,
+) -> List[Tuple]:
+    validate_sql_query(query)
+
+    with db._engine.connect() as connection:
+        result = connection.execute(text(query))
+
+        if result.returns_rows:
+            return [tuple(row) for row in result.fetchall()]
+
+    return []
+
 
 def clean_error_message(err: Exception) -> str:
-    """Format SQLAlchemy & SQLite error messages into clean user-facing strings."""
-    err_msg = str(err)
-    err_msg = re.sub(r'\(Background on this error at:.*?\)', '', err_msg, flags=re.DOTALL)
-    err_msg = re.sub(r'\[SQL:.*?\]', '', err_msg, flags=re.DOTALL)
-    err_msg = re.sub(r'\(sqlite3\.OperationalError\)\s*', '', err_msg)
-    err_msg = re.sub(r'Error code: 429 - .*?Please try again in [\d\.]+s\.', 'API Rate limit encountered. Please try again in a few seconds.', err_msg, flags=re.DOTALL)
-    return err_msg.strip()
+    message = str(err)
 
-def generate_and_execute_sql(write_query_chain: Any, db: SQLDatabase, question: str) -> Tuple[str, List[Tuple]]:
-    """Generate SQL, clean, validate, and execute with single retry logic."""
+    if "429" in message or "rate limit" in message.lower():
+        return "The AI service rate limit was reached. Please wait and try again."
+
+    if "no such table" in message.lower():
+        return (
+            "The requested table was not found in the selected database. "
+            "Check that the correct file and table were uploaded."
+        )
+
+    if "no such column" in message.lower():
+        return (
+            "A requested column was not found. Please check the uploaded "
+            "file's column names and try asking the question again."
+        )
+
+    return message[:1000]
+
+
+def generate_and_execute_sql(
+    write_query_chain: Any,
+    db: SQLDatabase,
+    question: str,
+) -> Tuple[str, List[Tuple]]:
     first_error = None
-    try:
-        raw_query = invoke_with_retry(write_query_chain, {"question": question})
-        sql_query = clean_sql_query(str(raw_query))
-        validate_sql_query(sql_query)
-        logger.info(f"Generated SQL: {sql_query}")
-        
-        result = execute_sql_with_sqlalchemy(db, sql_query)
-        logger.info(f"SQL Result: {result[:5]} (total {len(result)} rows)")
-        return sql_query, result
-    except Exception as e1:
-        first_error = e1
-        logger.warning(f"First SQL execution attempt failed: {e1}. Retrying...")
+
+    for attempt in range(2):
         try:
-            retry_question = f"{question} (Note: previous SQL attempt failed: {clean_error_message(e1)}. Output valid SELECT or WITH query using exact table and column names)."
-            raw_query = invoke_with_retry(write_query_chain, {"question": retry_question})
+            current_question = question
+
+            if attempt == 1 and first_error:
+                current_question = (
+                    f"{question}\nThe previous attempt failed with: "
+                    f"{clean_error_message(first_error)}. "
+                    "Use the exact schema and generate a valid read-only query."
+                )
+
+            raw_query = invoke_with_retry(
+                write_query_chain,
+                {"question": current_question},
+            )
+
             sql_query = clean_sql_query(str(raw_query))
             validate_sql_query(sql_query)
-            logger.info(f"Regenerated SQL (Attempt 2): {sql_query}")
-            
+
+            logger.info("Generated SQL: %s", sql_query)
+
             result = execute_sql_with_sqlalchemy(db, sql_query)
-            logger.info(f"SQL Result (Attempt 2): {result[:5]}")
+            logger.info("SQL returned %s rows.", len(result))
+
             return sql_query, result
-        except Exception as e2:
-            logger.error(f"Second SQL attempt failed: {e2}")
-            err_to_report = first_error if ("no such table" in str(first_error) or "no such column" in str(first_error)) else e2
-            cleaned_err = clean_error_message(err_to_report)
-            raise RuntimeError(cleaned_err)
+
+        except Exception as exc:
+            if attempt == 0:
+                first_error = exc
+                logger.warning("First SQL attempt failed: %s", exc)
+            else:
+                raise RuntimeError(clean_error_message(exc)) from exc
+
+    raise RuntimeError(clean_error_message(first_error))
+
+
+def add_message(history: List[dict], role: str, content: str) -> None:
+    """Append a message in the format expected by Gradio 6."""
+    history.append({"role": role, "content": str(content)})
+
+
+def history_to_text(history: List[dict]) -> str:
+    """Convert recent Gradio messages into context for SQL questions."""
+    recent = []
+
+    for item in history[-6:]:
+        if not isinstance(item, dict):
+            continue
+
+        role = item.get("role", "")
+        content = item.get("content", "")
+
+        if not isinstance(content, str) or not content.strip():
+            continue
+
+        if role == "user":
+            recent.append(f"User: {content}")
+        elif role == "assistant":
+            recent.append(f"Assistant: {content}")
+
+    return "\n".join(recent)
+
 
 class ChatBot:
     @staticmethod
-    def respond(chatbot: List, message: str, chat_type: str, app_functionality: str) -> Tuple[str, List]:
+    def respond(
+        chatbot: List,
+        message: str,
+        chat_type: str,
+        app_functionality: str,
+    ) -> Tuple[str, List[dict]]:
+        history = list(chatbot or [])
+
         if not message or not message.strip():
-            return "", chatbot
+            return "", history
 
-        chatbot = chatbot or []
+        question = message.strip()
 
-        if app_functionality == "Chat":
-            db_path = None
-            missing_db_error = ""
+        # This project currently implements chat-based SQL and RAG.
+                # Allow supported app functionality modes.
+        if app_functionality not in ("Chat", "Process files"):
+            add_message(history, "user", question)
+            add_message(
+                history,
+                "assistant",
+                "Please select Chat or Process files to continue.",
+            )
+            return "", history
 
-            if chat_type == "Q&A with stored SQL-DB":
-                db_path = APPCFG.sqldb_directory
-                missing_db_error = "SQL DB does not exist. Please check 'data/sqldb.db'."
-            elif chat_type == "Q&A with Uploaded CSV/XLSX SQL-DB":
-                db_path = APPCFG.uploaded_files_sqldb_directory
-                missing_db_error = "SQL DB for uploaded CSV/XLSX files does not exist. Please upload a CSV/XLSX file first."
-            elif chat_type == "Q&A with stored CSV/XLSX SQL-DB":
-                db_path = APPCFG.stored_csv_xlsx_sqldb_directory
-                missing_db_error = "SQL DB for stored CSV/XLSX files does not exist. Please run `prepare_csv_xlsx_sqlitedb.py` first."
-            elif chat_type == "RAG with stored CSV/XLSX ChromaDB":
-                try:
-                    collection = APPCFG.chroma_client.get_collection(name=APPCFG.collection_name)
-                    results = collection.query(query_texts=[message], n_results=APPCFG.top_k)
-                    docs = results.get("documents", [[]])[0]
-                    context = "\n".join(docs) if docs else "No matching documents found."
-                    
-                    answer_prompt = PromptTemplate.from_template(
-                        "Question: {question}\nSearch Context:\n{context}\nAnswer the question concisely based on the context:"
-                    )
-                    chain = answer_prompt | APPCFG.groq_llm | StrOutputParser()
-                    response = invoke_with_retry(chain, {"question": message, "context": context})
-                    chatbot.append((message, response))
-                    return "", chatbot
-                except Exception as e:
-                    logger.error(f"ChromaDB RAG query error: {e}")
-                    chatbot.append((message, f"Vector DB search failed: {clean_error_message(e)}. Make sure to run prepare_csv_xlsx_vectordb.py first."))
-                    return "", chatbot
-            else:
-                return "", chatbot
+        if chat_type == "RAG with stored CSV/XLSX ChromaDB":
+            try:
+                collection = APPCFG.chroma_client.get_collection(
+                    name=APPCFG.collection_name
+                )
 
-            if not db_path or not os.path.exists(db_path):
-                chatbot.append((message, missing_db_error))
-                return "", chatbot
+                results = collection.query(
+                    query_texts=[question],
+                    n_results=APPCFG.top_k,
+                )
+
+                documents = results.get("documents", [[]])[0]
+                context = (
+                    "\n".join(documents)
+                    if documents
+                    else "No matching documents found."
+                )
+
+                prompt = PromptTemplate.from_template(
+                    "Question: {question}\n"
+                    "Search context:\n{context}\n"
+                    "Answer clearly using the context. "
+                    "If the context does not contain the answer, say so."
+                )
+
+                chain = prompt | APPCFG.groq_llm | StrOutputParser()
+
+                response = invoke_with_retry(
+                    chain,
+                    {"question": question, "context": context},
+                )
+
+            except Exception as exc:
+                logger.exception("ChromaDB query failed")
+                response = (
+                    "Document search failed: "
+                    + clean_error_message(exc)
+                    + ". Check that the document index has been prepared."
+                )
+
+            add_message(history, "user", question)
+            add_message(history, "assistant", response)
+            return "", history
+
+        database_paths = {
+            "Q&A with stored SQL-DB": (
+                APPCFG.sqldb_directory,
+                "The stored SQL database was not found.",
+            ),
+            "Q&A with Uploaded CSV/XLSX SQL-DB": (
+                APPCFG.uploaded_files_sqldb_directory,
+                "The uploaded CSV/XLSX database was not found. Upload a file first.",
+            ),
+            "Q&A with stored CSV/XLSX SQL-DB": (
+                APPCFG.stored_csv_xlsx_sqldb_directory,
+                "The stored CSV/XLSX database was not found. Prepare the database first.",
+            ),
+        }
+
+        if chat_type not in database_paths:
+            add_message(history, "user", question)
+            add_message(
+                history,
+                "assistant",
+                "Please select a supported chat mode.",
+            )
+            return "", history
+
+        db_path, missing_message = database_paths[chat_type]
+
+        if not db_path or not os.path.exists(db_path):
+            add_message(history, "user", question)
+            add_message(history, "assistant", missing_message)
+            return "", history
+
+        try:
+            engine = create_engine(f"sqlite:///{db_path}")
 
             try:
-                engine = create_engine(f"sqlite:///{db_path}")
                 db = SQLDatabase(engine=engine)
 
                 table_names = db.get_usable_table_names()
+                logger.info("Available SQL tables: %s", table_names)
+
                 if not table_names:
-                    chatbot.append((message, "The database is currently empty. Please upload data or populate tables first."))
-                    return "", chatbot
-
-                write_query = create_sql_query_chain(APPCFG.groq_llm, db, prompt=SQL_PROMPT)
-
-                history_context = ""
-                if len(chatbot) > 0:
-                    recent_turns = []
-                    for u, b in chatbot[-3:]:
-                        if u and b and u != "Uploaded File(s)":
-                            recent_turns.append(f"User: {u}\nAssistant: {b}")
-                    if recent_turns:
-                        history_context = "Previous conversation:\n" + "\n".join(recent_turns) + "\n\nCurrent Question: "
-
-                query_input = f"{history_context}{message}" if history_context else message
-
-                sql_query, sql_result = generate_and_execute_sql(write_query, db, query_input)
-
-                if not sql_result:
-                    response = "No matching records found."
-                elif len(sql_result) == 1 and len(sql_result[0]) == 1 and sql_result[0][0] is not None:
-                    val = str(sql_result[0][0])
-                    response = f"Result: **{val}**"
+                    response = "The selected database contains no usable tables."
                 else:
-                    answer_prompt = PromptTemplate.from_template(ANSWER_PROMPT_TEMPLATE)
-                    answer_chain = answer_prompt | APPCFG.groq_llm | StrOutputParser()
-                    
-                    formatted_result = str(sql_result[:20])
-                    response = invoke_with_retry(answer_chain, {
-                        "question": message,
-                        "query": sql_query,
-                        "result": formatted_result
-                    })
+                    write_query = create_sql_query_chain(
+                        APPCFG.groq_llm,
+                        db,
+                        prompt=SQL_PROMPT,
+                    )
 
-                chatbot.append((message, response))
-                return "", chatbot
+                    previous_context = history_to_text(history)
+                    query_input = question
 
-            except Exception as e:
-                logger.error(f"Chatbot execution error: {e}", exc_info=True)
-                clean_err = clean_error_message(e)
-                chatbot.append((message, f"Query Error: {clean_err}"))
-                return "", chatbot
+                    if previous_context:
+                        query_input = (
+                            f"Previous conversation:\n{previous_context}\n\n"
+                            f"Current question: {question}"
+                        )
 
-        return "", chatbot
+                    sql_query, sql_result = generate_and_execute_sql(
+                        write_query,
+                        db,
+                        query_input,
+                    )
+
+                    if not sql_result:
+                        response = "No matching records were found."
+
+                    elif (
+                        len(sql_result) == 1
+                        and len(sql_result[0]) == 1
+                    ):
+                        response = f"Result: {sql_result[0][0]}"
+
+                    else:
+                        answer_prompt = PromptTemplate.from_template(
+                            ANSWER_PROMPT_TEMPLATE
+                        )
+                        answer_chain = (
+                            answer_prompt
+                            | APPCFG.groq_llm
+                            | StrOutputParser()
+                        )
+
+                        response = invoke_with_retry(
+                            answer_chain,
+                            {
+                                "question": question,
+                                "query": sql_query,
+                                "result": str(sql_result[:20]),
+                            },
+                        )
+
+            finally:
+                engine.dispose()
+
+        except Exception as exc:
+            logger.exception("Chatbot SQL execution failed")
+            response = "Query error: " + clean_error_message(exc)
+
+        add_message(history, "user", question)
+        add_message(history, "assistant", response)
+
+        return "", history
